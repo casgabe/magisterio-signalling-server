@@ -1,41 +1,25 @@
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
+const WebSocket = require('ws');
 
 const app = express();
 const server = http.createServer(app);
 
-// Configuração mais permissiva do Socket.IO
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["*"],
-    credentials: true
-  },
-  allowEIO3: true,
-  transports: ['websocket', 'polling'],
-  path: '/socket.io/',
-  pingTimeout: 60000,
-  pingInterval: 25000,
-  upgradeTimeout: 30000,
-  maxHttpBufferSize: 1e8
+// WebSocket Server puro (não Socket.IO)
+const wss = new WebSocket.Server({ 
+  server,
+  path: '/',
+  perMessageDeflate: false
 });
 
 const rooms = new Map();
-const peers = new Map();
+const clients = new Map();
 
-// Middleware de logging
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
-  next();
-});
-
-// Health check
+// Health check HTTP
 app.get('/', (req, res) => {
   res.send(`
     <h1>✅ Construct 3 Signalling Server Online</h1>
-    <p>Connections: ${io.engine.clientsCount}</p>
+    <p>Active Connections: ${wss.clients.size}</p>
     <p>Rooms: ${rooms.size}</p>
     <p>Server Time: ${new Date().toISOString()}</p>
   `);
@@ -44,144 +28,220 @@ app.get('/', (req, res) => {
 app.get('/status', (req, res) => {
   res.json({
     status: 'online',
-    connections: io.engine.clientsCount,
+    connections: wss.clients.size,
     rooms: rooms.size,
-    peers: peers.size,
     uptime: process.uptime(),
     timestamp: new Date().toISOString()
   });
 });
 
-// Socket.IO events
-io.on('connection', (socket) => {
-  console.log('✅ Cliente conectado:', socket.id, '| Total:', io.engine.clientsCount);
-  
-  peers.set(socket.id, {
-    id: socket.id,
+// WebSocket connection
+wss.on('connection', (ws, req) => {
+  const clientId = generateId();
+  clients.set(ws, {
+    id: clientId,
     rooms: new Set()
   });
+  
+  console.log('✅ Cliente conectado:', clientId, '| Total:', wss.clients.size);
+  
+  // Envia ID do cliente
+  ws.send(JSON.stringify({
+    type: 'id',
+    id: clientId
+  }));
 
-  // Join room
-  socket.on('join-room', (roomId) => {
-    socket.join(roomId);
-    
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, new Set());
-    }
-    rooms.get(roomId).add(socket.id);
-    
-    if (peers.has(socket.id)) {
-      peers.get(socket.id).rooms.add(roomId);
-    }
-    
-    console.log(`👥 ${socket.id} entrou na sala ${roomId} | Membros: ${rooms.get(roomId).size}`);
-    
-    // Notifica outros peers
-    socket.to(roomId).emit('user-joined', {
-      peerId: socket.id,
-      roomId: roomId
-    });
-    
-    // Confirma para o cliente
-    socket.emit('joined-room', {
-      roomId: roomId,
-      peerId: socket.id
-    });
-  });
-
-  // Signal (WebRTC)
-  socket.on('signal', (data) => {
-    if (data && data.to) {
-      io.to(data.to).emit('signal', {
-        from: socket.id,
-        signal: data.signal,
-        data: data.data
-      });
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+      handleMessage(ws, message);
+    } catch (error) {
+      console.error('Erro ao processar mensagem:', error);
     }
   });
 
-  // Broadcast to room
-  socket.on('room-message', (data) => {
-    if (data && data.roomId) {
-      socket.to(data.roomId).emit('room-message', {
-        from: socket.id,
-        data: data.data
-      });
-    }
-  });
-
-  // Leave room
-  socket.on('leave-room', (roomId) => {
-    socket.leave(roomId);
-    
-    if (rooms.has(roomId)) {
-      rooms.get(roomId).delete(socket.id);
-      if (rooms.get(roomId).size === 0) {
-        rooms.delete(roomId);
-      }
-    }
-    
-    if (peers.has(socket.id)) {
-      peers.get(socket.id).rooms.delete(roomId);
-    }
-    
-    socket.to(roomId).emit('user-left', {
-      peerId: socket.id,
-      roomId: roomId
-    });
-    
-    console.log(`👋 ${socket.id} saiu da sala ${roomId}`);
-  });
-
-  // Disconnect
-  socket.on('disconnect', (reason) => {
-    console.log('❌ Cliente desconectado:', socket.id, '| Razão:', reason);
-    
-    // Remove de todas as salas
-    if (peers.has(socket.id)) {
-      const peerRooms = peers.get(socket.id).rooms;
-      peerRooms.forEach(roomId => {
+  ws.on('close', () => {
+    const client = clients.get(ws);
+    if (client) {
+      console.log('❌ Cliente desconectado:', client.id);
+      
+      // Remove de todas as salas
+      client.rooms.forEach(roomId => {
         if (rooms.has(roomId)) {
-          rooms.get(roomId).delete(socket.id);
+          rooms.get(roomId).delete(ws);
+          
+          // Notifica outros na sala
+          broadcast(roomId, {
+            type: 'peer-disconnect',
+            id: client.id
+          }, ws);
+          
+          // Remove sala vazia
           if (rooms.get(roomId).size === 0) {
             rooms.delete(roomId);
           }
         }
-        socket.to(roomId).emit('user-left', {
-          peerId: socket.id,
-          roomId: roomId
-        });
       });
-      peers.delete(socket.id);
+      
+      clients.delete(ws);
     }
   });
 
-  // Error handling
-  socket.on('error', (error) => {
-    console.error('Socket error:', socket.id, error);
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
   });
 });
 
-// Error handling do servidor
-server.on('error', (error) => {
-  console.error('Server error:', error);
-});
+function handleMessage(ws, message) {
+  const client = clients.get(ws);
+  if (!client) return;
 
-io.engine.on('connection_error', (err) => {
-  console.error('Connection error:', err);
-});
+  switch (message.type) {
+    case 'join':
+      handleJoin(ws, client, message);
+      break;
+      
+    case 'leave':
+      handleLeave(ws, client, message);
+      break;
+      
+    case 'signal':
+      handleSignal(ws, client, message);
+      break;
+      
+    case 'broadcast':
+      handleBroadcast(ws, client, message);
+      break;
+      
+    default:
+      // Encaminha mensagens desconhecidas para a sala
+      if (message.room) {
+        broadcast(message.room, message, ws);
+      }
+  }
+}
 
-// Inicia o servidor
+function handleJoin(ws, client, message) {
+  const roomId = message.room;
+  
+  if (!roomId) return;
+  
+  // Cria sala se não existe
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, new Set());
+  }
+  
+  // Adiciona cliente à sala
+  rooms.get(roomId).add(ws);
+  client.rooms.add(roomId);
+  
+  console.log(`👥 ${client.id} entrou na sala ${roomId} | Membros: ${rooms.get(roomId).size}`);
+  
+  // Lista de peers já na sala
+  const peers = [];
+  rooms.get(roomId).forEach(peerWs => {
+    if (peerWs !== ws && clients.has(peerWs)) {
+      peers.push(clients.get(peerWs).id);
+    }
+  });
+  
+  // Confirma join para o cliente
+  ws.send(JSON.stringify({
+    type: 'joined',
+    room: roomId,
+    id: client.id,
+    peers: peers
+  }));
+  
+  // Notifica outros peers
+  broadcast(roomId, {
+    type: 'peer-connect',
+    id: client.id
+  }, ws);
+}
+
+function handleLeave(ws, client, message) {
+  const roomId = message.room;
+  
+  if (!roomId || !rooms.has(roomId)) return;
+  
+  rooms.get(roomId).delete(ws);
+  client.rooms.delete(roomId);
+  
+  // Notifica outros
+  broadcast(roomId, {
+    type: 'peer-disconnect',
+    id: client.id
+  }, ws);
+  
+  // Remove sala vazia
+  if (rooms.get(roomId).size === 0) {
+    rooms.delete(roomId);
+  }
+  
+  console.log(`👋 ${client.id} saiu da sala ${roomId}`);
+}
+
+function handleSignal(ws, client, message) {
+  // Encaminha sinal WebRTC para peer específico
+  const targetId = message.to;
+  
+  if (!targetId) return;
+  
+  // Encontra o WebSocket do destinatário
+  for (const [peerWs, peerClient] of clients.entries()) {
+    if (peerClient.id === targetId) {
+      peerWs.send(JSON.stringify({
+        type: 'signal',
+        from: client.id,
+        signal: message.signal,
+        data: message.data
+      }));
+      break;
+    }
+  }
+}
+
+function handleBroadcast(ws, client, message) {
+  const roomId = message.room;
+  
+  if (!roomId || !rooms.has(roomId)) return;
+  
+  broadcast(roomId, {
+    type: 'message',
+    from: client.id,
+    data: message.data
+  }, ws);
+}
+
+function broadcast(roomId, message, excludeWs = null) {
+  if (!rooms.has(roomId)) return;
+  
+  const messageStr = JSON.stringify(message);
+  
+  rooms.get(roomId).forEach(ws => {
+    if (ws !== excludeWs && ws.readyState === WebSocket.OPEN) {
+      ws.send(messageStr);
+    }
+  });
+}
+
+function generateId() {
+  return Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+}
+
+// Inicia servidor
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
-  console.log(`📡 WebSocket path: /socket.io/`);
-  console.log(`🌍 Acesse: http://0.0.0.0:${PORT}`);
+  console.log(`🚀 Servidor WebSocket rodando na porta ${PORT}`);
+  console.log(`🌍 HTTP: http://0.0.0.0:${PORT}`);
+  console.log(`📡 WebSocket: ws://0.0.0.0:${PORT}`);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM recebido, fechando servidor...');
+  wss.clients.forEach(ws => ws.close());
   server.close(() => {
     console.log('Servidor fechado');
     process.exit(0);
