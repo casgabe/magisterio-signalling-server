@@ -1,6 +1,6 @@
 // ============================================
-// Construct 3 Signalling Server
-// Compatible with Construct 2/3 Multiplayer
+// Construct 2/3 Signalling Server  
+// Baseado no servidor oficial da Scirra
 // ============================================
 
 const WebSocket = require('ws');
@@ -15,26 +15,18 @@ const config = {
   server_host: "0.0.0.0",
   server_port: process.env.PORT || 10000,
   
-  // SSL (deixe null para desenvolvimento)
+  // SSL (deixe null se não tiver certificado)
   ssl_key_file: null,
   ssl_cert_file: null,
   
-  // STUN/TURN servers (padrões do Google/Mozilla)
+  // STUN servers para WebRTC
   ice_servers: [
     { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun3.l.google.com:19302" },
-    { urls: "stun:stun4.l.google.com:19302" }
+    { urls: "stun:stun1.l.google.com:19302" }
   ],
   
-  // Limites
   max_rooms: 1000,
-  max_peers_per_room: 50,
-  
-  // Timeouts
-  room_timeout: 300000,  // 5 minutos
-  ping_interval: 30000   // 30 segundos
+  max_peers_per_room: 4
 };
 
 // ============================================
@@ -47,117 +39,69 @@ if (config.ssl_key_file && config.ssl_cert_file) {
     cert: fs.readFileSync(config.ssl_cert_file)
   };
   server = https.createServer(ssl_options, handleHTTP);
-  console.log('🔒 Servidor HTTPS iniciado');
 } else {
   server = http.createServer(handleHTTP);
-  console.log('🔓 Servidor HTTP iniciado (sem SSL)');
 }
 
 function handleHTTP(req, res) {
-  if (req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Construct 3 Signalling Server</title>
-        <style>
-          body { font-family: Arial; padding: 40px; background: #1a1a2e; color: #eee; }
-          h1 { color: #0f3460; }
-          .stat { background: #16213e; padding: 15px; margin: 10px 0; border-radius: 5px; }
-        </style>
-      </head>
-      <body>
-        <h1>✅ Construct 3 Signalling Server Online</h1>
-        <div class="stat">Active Connections: ${wss.clients.size}</div>
-        <div class="stat">Active Rooms: ${rooms.size}</div>
-        <div class="stat">Uptime: ${Math.floor(process.uptime())}s</div>
-        <div class="stat">Server Time: ${new Date().toISOString()}</div>
-      </body>
-      </html>
-    `);
-  } else if (req.url === '/status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'online',
-      connections: wss.clients.size,
-      rooms: rooms.size,
-      uptime: process.uptime(),
-      timestamp: new Date().toISOString()
-    }));
-  } else {
-    res.writeHead(404);
-    res.end('Not Found');
-  }
+  const roomCount = Object.keys(rooms).length;
+  const peerCount = Object.keys(peers).length;
+  
+  res.writeHead(200, { 'Content-Type': 'text/html' });
+  res.end(`
+    <html>
+    <head><title>Construct Signalling Server</title></head>
+    <body style="font-family:Arial;padding:20px;background:#1a1a2e;color:#eee;">
+      <h1>✅ Construct 2/3 Signalling Server</h1>
+      <p>Active Connections: ${peerCount}</p>
+      <p>Active Rooms: ${roomCount}</p>
+      <p>Uptime: ${Math.floor(process.uptime())}s</p>
+      <p>Server Time: ${new Date().toISOString()}</p>
+    </body>
+    </html>
+  `);
 }
 
 // ============================================
 // WEBSOCKET SERVER
 // ============================================
 const wss = new WebSocket.Server({ 
-  server,
-  perMessageDeflate: false,
-  clientTracking: true
+  server: server,
+  perMessageDeflate: false
 });
 
 // ============================================
 // ESTRUTURAS DE DADOS
 // ============================================
-const rooms = new Map();
-const peers = new Map();
+const rooms = {}; // { roomName: { host: peerId, locked: bool, peers: [] } }
+const peers = {}; // { peerId: { ws, alias, rooms: [] } }
 
 // ============================================
 // FUNÇÕES AUXILIARES
 // ============================================
 
-function generateId() {
-  return Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+function generatePeerId() {
+  return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
 
-function sendMessage(ws, msg) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
+function sendToPeer(ws, msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const json = JSON.stringify(msg);
+    ws.send(json);
+    console.log(`→ Enviando para peer:`, JSON.stringify(msg, null, 2));
   }
 }
 
-function broadcastToRoom(roomId, msg, excludeWs = null) {
-  const room = rooms.get(roomId);
+function broadcastToRoom(roomName, msg, excludeWs = null) {
+  const room = rooms[roomName];
   if (!room) return;
   
-  const msgStr = JSON.stringify(msg);
   room.peers.forEach(peerId => {
-    const peer = peers.get(peerId);
-    if (peer && peer.ws !== excludeWs && peer.ws.readyState === WebSocket.OPEN) {
-      peer.ws.send(msgStr);
+    const peer = peers[peerId];
+    if (peer && peer.ws !== excludeWs) {
+      sendToPeer(peer.ws, msg);
     }
   });
-}
-
-function cleanupPeer(ws) {
-  const peer = peers.get(ws.peerId);
-  if (!peer) return;
-  
-  // Remove de todas as salas
-  peer.rooms.forEach(roomId => {
-    const room = rooms.get(roomId);
-    if (room) {
-      room.peers.delete(ws.peerId);
-      
-      // Notifica outros peers
-      broadcastToRoom(roomId, {
-        type: 'peer-disconnect',
-        id: ws.peerId
-      });
-      
-      // Remove sala vazia ou se era o host
-      if (room.peers.size === 0 || room.host === ws.peerId) {
-        rooms.delete(roomId);
-        console.log(`🗑️  Sala removida: ${roomId}`);
-      }
-    }
-  });
-  
-  peers.delete(ws.peerId);
 }
 
 // ============================================
@@ -165,154 +109,144 @@ function cleanupPeer(ws) {
 // ============================================
 
 function handleLogin(ws, msg) {
-  if (peers.has(ws.peerId)) {
-    sendMessage(ws, { type: 'error', message: 'Already logged in' });
-    return;
-  }
+  const peerId = msg.id || generatePeerId();
+  const alias = msg.alias || 'Anonymous';
   
-  peers.set(ws.peerId, {
-    id: ws.peerId,
+  ws.peerId = peerId;
+  
+  peers[peerId] = {
     ws: ws,
-    alias: msg.alias || 'Anonymous',
-    rooms: new Set()
-  });
+    alias: alias,
+    rooms: []
+  };
   
-  console.log(`✅ Login: ${msg.alias} (${ws.peerId})`);
+  console.log(`✅ LOGIN: ${alias} (${peerId})`);
   
-  sendMessage(ws, {
+  // Responde com login bem-sucedido
+  sendToPeer(ws, {
     type: 'login',
-    id: ws.peerId,
+    id: peerId,
     ice_servers: config.ice_servers
   });
 }
 
 function handleJoin(ws, msg) {
-  const peer = peers.get(ws.peerId);
+  const peerId = ws.peerId;
+  const peer = peers[peerId];
+  
   if (!peer) {
-    sendMessage(ws, { type: 'error', message: 'Not logged in' });
+    console.log(`❌ Peer ${peerId} não está logado`);
     return;
   }
   
-  const roomId = msg.room;
-  let room = rooms.get(roomId);
+  const roomName = msg.room;
+  let room = rooms[roomName];
   
-  // Cria sala se não existe (peer se torna host)
+  // Cria sala se não existe
   if (!room) {
-    if (rooms.size >= config.max_rooms) {
-      sendMessage(ws, { type: 'error', message: 'Server full' });
+    if (Object.keys(rooms).length >= config.max_rooms) {
+      sendToPeer(ws, { type: 'error', message: 'Server full' });
       return;
     }
     
     room = {
-      id: roomId,
-      host: ws.peerId,
+      host: peerId,
       locked: false,
-      peers: new Set(),
-      created: Date.now()
+      peers: []
     };
-    rooms.set(roomId, room);
-    console.log(`🏠 Sala criada: ${roomId} por ${peer.alias}`);
+    rooms[roomName] = room;
+    console.log(`🏠 Sala criada: "${roomName}" por ${peer.alias}`);
   }
   
-  // Verifica limites
-  if (room.peers.size >= config.max_peers_per_room) {
-    sendMessage(ws, { type: 'error', message: 'Room full' });
+  // Verifica se a sala está cheia
+  if (room.peers.length >= config.max_peers_per_room) {
+    sendToPeer(ws, { type: 'error', message: 'Room full' });
     return;
   }
   
-  if (room.locked && room.host !== ws.peerId) {
-    sendMessage(ws, { type: 'error', message: 'Room locked' });
+  // Verifica se a sala está trancada
+  if (room.locked && room.host !== peerId) {
+    sendToPeer(ws, { type: 'error', message: 'Room locked' });
     return;
   }
   
   // Adiciona peer à sala
-  room.peers.add(ws.peerId);
-  peer.rooms.add(roomId);
+  room.peers.push(peerId);
+  peer.rooms.push(roomName);
   
-  const isHost = room.host === ws.peerId;
+  const isHost = (room.host === peerId);
   
-  console.log(`👥 ${peer.alias} entrou na sala ${roomId} ${isHost ? '(HOST)' : '(PEER)'}`);
+  console.log(`👥 ${peer.alias} entrou em "${roomName}" ${isHost ? '(HOST)' : '(PEER)'}`);
   
-  // Notifica o peer que entrou
-  sendMessage(ws, {
+  // Envia confirmação ao peer que entrou
+  sendToPeer(ws, {
     type: 'join',
-    room: roomId,
-    id: ws.peerId,
+    room: roomName,
+    id: peerId,
     host: isHost
   });
   
-  // Envia lista de peers já na sala (exceto ele mesmo)
-  const peersList = [];
-  room.peers.forEach(peerId => {
-    if (peerId !== ws.peerId) {
-      const p = peers.get(peerId);
-      if (p) {
-        peersList.push({
-          id: p.id,
-          alias: p.alias
-        });
-      }
-    }
-  });
-  
-  if (peersList.length > 0) {
-    sendMessage(ws, {
-      type: 'peer-list',
-      peers: peersList
-    });
-  }
-  
   // Notifica outros peers na sala
-  broadcastToRoom(roomId, {
+  broadcastToRoom(roomName, {
     type: 'peer-connect',
-    id: ws.peerId,
+    id: peerId,
     alias: peer.alias
   }, ws);
 }
 
 function handleLeave(ws, msg) {
-  const peer = peers.get(ws.peerId);
+  const peerId = ws.peerId;
+  const peer = peers[peerId];
+  
   if (!peer) return;
   
-  const roomId = msg.room;
-  const room = rooms.get(roomId);
+  const roomName = msg.room;
+  const room = rooms[roomName];
   
-  if (!room || !peer.rooms.has(roomId)) return;
+  if (!room) return;
   
-  room.peers.delete(ws.peerId);
-  peer.rooms.delete(roomId);
-  
-  console.log(`👋 ${peer.alias} saiu da sala ${roomId}`);
-  
-  // Notifica outros
-  broadcastToRoom(roomId, {
-    type: 'peer-disconnect',
-    id: ws.peerId
-  });
-  
-  // Remove sala vazia ou se era host
-  if (room.peers.size === 0 || room.host === ws.peerId) {
-    rooms.delete(roomId);
-    console.log(`🗑️  Sala removida: ${roomId}`);
+  // Remove peer da sala
+  const idx = room.peers.indexOf(peerId);
+  if (idx !== -1) {
+    room.peers.splice(idx, 1);
   }
   
-  sendMessage(ws, {
+  const idx2 = peer.rooms.indexOf(roomName);
+  if (idx2 !== -1) {
+    peer.rooms.splice(idx2, 1);
+  }
+  
+  console.log(`👋 ${peer.alias} saiu de "${roomName}"`);
+  
+  // Notifica outros peers
+  broadcastToRoom(roomName, {
+    type: 'peer-disconnect',
+    id: peerId
+  });
+  
+  // Remove sala se vazia ou se o host saiu
+  if (room.peers.length === 0 || room.host === peerId) {
+    delete rooms[roomName];
+    console.log(`🗑️  Sala removida: "${roomName}"`);
+  }
+  
+  sendToPeer(ws, {
     type: 'leave',
-    room: roomId
+    room: roomName
   });
 }
 
 function handleSignal(ws, msg) {
   const targetId = msg.to;
-  const targetPeer = peers.get(targetId);
+  const targetPeer = peers[targetId];
   
   if (!targetPeer) {
-    sendMessage(ws, { type: 'error', message: 'Peer not found' });
+    console.log(`❌ Peer alvo ${targetId} não encontrado`);
     return;
   }
   
   // Encaminha sinal WebRTC
-  sendMessage(targetPeer.ws, {
+  sendToPeer(targetPeer.ws, {
     type: 'signal',
     from: ws.peerId,
     data: msg.data
@@ -320,82 +254,87 @@ function handleSignal(ws, msg) {
 }
 
 function handleKick(ws, msg) {
-  const peer = peers.get(ws.peerId);
+  const peerId = ws.peerId;
+  const peer = peers[peerId];
+  
   if (!peer) return;
   
-  const roomId = msg.room;
-  const room = rooms.get(roomId);
+  const roomName = msg.room;
+  const room = rooms[roomName];
   
-  if (!room || room.host !== ws.peerId) {
-    sendMessage(ws, { type: 'error', message: 'Not host' });
+  if (!room || room.host !== peerId) {
+    sendToPeer(ws, { type: 'error', message: 'Not host' });
     return;
   }
   
   const kickId = msg.kick;
-  const kickPeer = peers.get(kickId);
+  const kickPeer = peers[kickId];
   
   if (!kickPeer) return;
   
-  room.peers.delete(kickId);
-  kickPeer.rooms.delete(roomId);
+  // Remove peer da sala
+  const idx = room.peers.indexOf(kickId);
+  if (idx !== -1) {
+    room.peers.splice(idx, 1);
+  }
   
-  console.log(`⚠️  ${kickPeer.alias} foi removido da sala ${roomId}`);
+  const idx2 = kickPeer.rooms.indexOf(roomName);
+  if (idx2 !== -1) {
+    kickPeer.rooms.splice(idx2, 1);
+  }
+  
+  console.log(`⚠️  ${kickPeer.alias} removido de "${roomName}"`);
   
   // Notifica o peer kickado
-  sendMessage(kickPeer.ws, {
+  sendToPeer(kickPeer.ws, {
     type: 'kicked',
-    room: roomId
+    room: roomName
   });
   
-  // Notifica outros
-  broadcastToRoom(roomId, {
+  // Notifica outros peers
+  broadcastToRoom(roomName, {
     type: 'peer-disconnect',
     id: kickId
   });
 }
 
 function handleLock(ws, msg) {
-  const peer = peers.get(ws.peerId);
+  const peerId = ws.peerId;
+  const peer = peers[peerId];
+  
   if (!peer) return;
   
-  const roomId = msg.room;
-  const room = rooms.get(roomId);
+  const roomName = msg.room;
+  const room = rooms[roomName];
   
-  if (!room || room.host !== ws.peerId) {
-    sendMessage(ws, { type: 'error', message: 'Not host' });
+  if (!room || room.host !== peerId) {
+    sendToPeer(ws, { type: 'error', message: 'Not host' });
     return;
   }
   
   room.locked = msg.locked;
   
-  console.log(`🔒 Sala ${roomId} ${room.locked ? 'trancada' : 'destrancada'}`);
+  console.log(`🔒 Sala "${roomName}" ${room.locked ? 'trancada' : 'destrancada'}`);
   
-  broadcastToRoom(roomId, {
+  broadcastToRoom(roomName, {
     type: 'lock',
-    room: roomId,
+    room: roomName,
     locked: room.locked
   });
 }
 
 // ============================================
-// WEBSOCKET CONNECTION
+// CONEXÃO WEBSOCKET
 // ============================================
 
 wss.on('connection', (ws, req) => {
-  ws.peerId = generateId();
-  
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  console.log(`🔌 Nova conexão: ${ws.peerId} de ${ip}`);
-  
-  // Ping/pong para manter conexão viva
-  ws.isAlive = true;
-  ws.on('pong', () => {
-    ws.isAlive = true;
-  });
+  console.log(`\n🔌 Nova conexão de ${ip}`);
   
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
+      console.log(`← Recebido:`, JSON.stringify(msg, null, 2));
       
       switch (msg.type) {
         case 'login':
@@ -417,7 +356,8 @@ wss.on('connection', (ws, req) => {
           handleLock(ws, msg);
           break;
         default:
-          console.log(`⚠️  Mensagem desconhecida: ${msg.type}`);
+          console.log(`⚠️  Tipo de mensagem desconhecido: ${msg.type}`);
+          // NÃO envia erro de volta, apenas ignora
       }
     } catch (error) {
       console.error('❌ Erro ao processar mensagem:', error);
@@ -425,8 +365,35 @@ wss.on('connection', (ws, req) => {
   });
   
   ws.on('close', () => {
-    console.log(`❌ Desconectado: ${ws.peerId}`);
-    cleanupPeer(ws);
+    const peerId = ws.peerId;
+    const peer = peers[peerId];
+    
+    if (peer) {
+      console.log(`❌ Desconectado: ${peer.alias} (${peerId})`);
+      
+      // Remove de todas as salas
+      peer.rooms.forEach(roomName => {
+        const room = rooms[roomName];
+        if (room) {
+          const idx = room.peers.indexOf(peerId);
+          if (idx !== -1) {
+            room.peers.splice(idx, 1);
+          }
+          
+          broadcastToRoom(roomName, {
+            type: 'peer-disconnect',
+            id: peerId
+          });
+          
+          if (room.peers.length === 0 || room.host === peerId) {
+            delete rooms[roomName];
+            console.log(`🗑️  Sala removida: "${roomName}"`);
+          }
+        }
+      });
+      
+      delete peers[peerId];
+    }
   });
   
   ws.on('error', (error) => {
@@ -435,76 +402,31 @@ wss.on('connection', (ws, req) => {
 });
 
 // ============================================
-// PING/PONG HEARTBEAT
+// INICIA SERVIDOR
 // ============================================
 
-const heartbeat = setInterval(() => {
-  wss.clients.forEach(ws => {
-    if (!ws.isAlive) {
-      console.log(`💀 Timeout: ${ws.peerId}`);
-      return ws.terminate();
-    }
-    
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, config.ping_interval);
-
-// ============================================
-// LIMPEZA DE SALAS ANTIGAS
-// ============================================
-
-const cleanup = setInterval(() => {
-  const now = Date.now();
-  rooms.forEach((room, roomId) => {
-    if (now - room.created > config.room_timeout) {
-      console.log(`🧹 Limpando sala antiga: ${roomId}`);
-      rooms.delete(roomId);
-    }
-  });
-}, 60000); // A cada 1 minuto
+server.listen(config.server_port, config.server_host, () => {
+  console.log('');
+  console.log('╔═══════════════════════════════════════╗');
+  console.log('║  Construct 2/3 Signalling Server     ║');
+  console.log('╚═══════════════════════════════════════╝');
+  console.log('');
+  console.log(`🚀 Servidor: ${config.server_host}:${config.server_port}`);
+  console.log(`📡 WebSocket: ${config.ssl_key_file ? 'wss' : 'ws'}://${config.server_host}:${config.server_port}`);
+  console.log('');
+  console.log('Aguardando conexões...');
+  console.log('');
+});
 
 // ============================================
 // GRACEFUL SHUTDOWN
 // ============================================
 
 process.on('SIGTERM', () => {
-  console.log('⚠️  SIGTERM recebido, fechando servidor...');
-  clearInterval(heartbeat);
-  clearInterval(cleanup);
-  
-  wss.clients.forEach(ws => {
-    ws.close(1000, 'Server shutting down');
-  });
-  
+  console.log('⚠️  Encerrando servidor...');
+  wss.clients.forEach(ws => ws.close());
   server.close(() => {
-    console.log('✅ Servidor fechado');
+    console.log('✅ Servidor encerrado');
     process.exit(0);
   });
-});
-
-process.on('SIGINT', () => {
-  console.log('⚠️  SIGINT recebido, fechando servidor...');
-  process.exit(0);
-});
-
-// ============================================
-// INICIA SERVIDOR
-// ============================================
-
-server.listen(config.server_port, config.server_host, () => {
-  console.log('');
-  console.log('╔════════════════════════════════════════╗');
-  console.log('║  Construct 3 Signalling Server v1.0   ║');
-  console.log('╚════════════════════════════════════════╝');
-  console.log('');
-  console.log(`🚀 Servidor rodando em ${config.server_host}:${config.server_port}`);
-  console.log(`📡 WebSocket: ${config.ssl_key_file ? 'wss' : 'ws'}://${config.server_host}:${config.server_port}`);
-  console.log(`🌐 HTTP: http://${config.server_host}:${config.server_port}`);
-  console.log('');
-  console.log(`📊 Max Rooms: ${config.max_rooms}`);
-  console.log(`👥 Max Peers/Room: ${config.max_peers_per_room}`);
-  console.log('');
-  console.log('Aguardando conexões...');
-  console.log('');
 });
